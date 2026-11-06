@@ -1,5 +1,9 @@
 -- MercuryWebBanking.lua
 -- MoneyMoney WebBanking-Plugin for Mercury.com transactions
+-- Version 1.9.1 - Treasury detection: match "Treasury" anywhere in account.name (MoneyMoney
+--                 renames e.g. "ADvendio USA Treasury …"; "^Treasury" was false → wrong API path).
+-- Version 1.9.0 - Treasury: fetch transactions from /api/v1/treasury/{id}/transactions
+--                 (not /account/{id}/transactions) so postings stay in sync with balance.
 -- Version 1.8.0 - Fixed Treasury balance (was never fetched from API during refresh).
 --                 Fixed Credit card balance handling.
 --                 Treasury and Credit now fetch live balances from API.
@@ -10,13 +14,12 @@
 --                 Fixed transaction status filter (added 'completed').
 --                 Pagination limit warning.
 -- Version 1.6.0 - Added support for Credit Card accounts.
--- Known Issue: Treasury account balance may be incorrect due to Mercury API limitations
---              (missing transaction types like dividends/interest).
+-- Known Issue: Very old Treasury history may be truncated if you hit the pagination page cap.
 -- Creation Date: 2025-05-15
 
 -- Define service name as a local constant
 local MY_SERVICE_NAME = "Mercury API"
-local SCRIPT_VERSION = 1.800 -- Unique internal versioning
+local SCRIPT_VERSION = 1.901 -- Unique internal versioning
 
 -- WebBanking registration call at the very beginning
 WebBanking{
@@ -246,7 +249,8 @@ function RefreshAccount(account, since)
     -- Determine account type flags using NAME-based detection
     -- MoneyMoney maps types differently than our internal strings
     -- (e.g., "Credit card" instead of "AccountTypeCreditCard", "Unknown" for Treasury)
-    local isTreasuryAccount = string.match(account.name, "^Treasury")
+    -- MoneyMoney often prefixes the display name ("ADvendio USA Treasury …"); do not anchor to "^Treasury"
+    local isTreasuryAccount = string.find(account.name or "", "Treasury", 1, true)
     local isCreditCardAccount = string.match(account.name, "Credit Card")
 
     debugLog("RefreshAccount: Account '"..account.name.."' flags - isTreasury: " .. tostring(isTreasuryAccount ~= nil) .. ", isCreditCard: " .. tostring(isCreditCardAccount ~= nil) .. ", MM-Type: " .. tostring(account.type))
@@ -349,121 +353,230 @@ function RefreshAccount(account, since)
         end
     end
     
-    -- Fetch transactions (logic is the same for regular, treasury, and credit accounts as per Mercury docs)
     local allTransactionsForMoneyMoney = {}
-    local transactionsApiUrlBase = "https://api.mercury.com/api/v1/account/" .. mercuryAccountUUID .. "/transactions"
-    debugLog("RefreshAccount: Fetching transactions for '"..account.name.."' (ID: "..mercuryAccountUUID..") via /account/{id}/transactions.")
-
-    local currentOffset = 0
-    local limit = 200 
-    local moreTransactionsExist = true
     local totalTransactionsFetchedFromApi = 0
-    local pagesFetched = 0
-    local queryParams = {}
-    local unixEpochStartApprox = 0 
 
-    if not since or since <= unixEpochStartApprox then 
-        queryParams.start = "2000-01-01" 
-        debugLog("RefreshAccount: 'since' ("..tostring(since)..") for '"..account.name.."' indicates initial fetch. Setting 'start' to " .. queryParams.start)
-    else
-        local dateSinceTable = os.date("!*t", since); 
-        queryParams.start = string.format("%04d-%02d-%02d", dateSinceTable.year, dateSinceTable.month, dateSinceTable.day)
-        debugLog("RefreshAccount: Normal fetch for '"..account.name.."'. Filtering transactions with 'start': " .. queryParams.start)
-    end
-    
-    while moreTransactionsExist and pagesFetched < 25 do 
-        pagesFetched = pagesFetched + 1
-        queryParams.limit = limit
-        queryParams.offset = currentOffset
-
-        local queryParamsString = ""
-        local firstParam = true
-        for key, value in pairs(queryParams) do
-            queryParamsString = queryParamsString .. (firstParam and "?" or "&") .. urlEncode(key) .. "=" .. urlEncode(value)
-            firstParam = false
-        end
-        
-        local fullApiUrl = transactionsApiUrlBase .. queryParamsString
-        debugLog("RefreshAccount: API URL for '"..account.name.."' (Page " .. pagesFetched .. ", Offset " .. currentOffset .. "): " .. fullApiUrl)
-
-        local txContent = connection:request( "GET", fullApiUrl, "", "", headers )
-        if not txContent or txContent == "" then
-            criticalLog("RefreshAccount: ERROR - No response from API (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."', URL: " .. fullApiUrl)
-            moreTransactionsExist = false; break
-        end
-        
-        if enableDebug and #txContent < 2000 then debugLog("RefreshAccount: Response Body (Page " .. pagesFetched .. "): " .. txContent) 
-        elseif enableDebug then debugLog("RefreshAccount: Response Body (Page " .. pagesFetched .. ", truncated): " .. string.sub(txContent, 1, 1500)) end
-
-        local txJsonData, tx_ParseError = safeParseJSON(txContent)
-        if not txJsonData or tx_ParseError then
-            criticalLog("RefreshAccount: ERROR parsing JSON (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."': " .. tostring(tx_ParseError))
-            moreTransactionsExist = false; break
-        end
-
-        if txJsonData.errors then
-            criticalLog("RefreshAccount: API reports errors (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."': " .. (enableDebug and dump(txJsonData.errors) or "Debug disabled"))
-            moreTransactionsExist = false; break
-        end
-
-        local mercuryAPITransactions = txJsonData.transactions
-        if type(mercuryAPITransactions) ~= "table" then
-            criticalLog("RefreshAccount: 'transactions' array not found in JSON (Page " .. pagesFetched .. ") for '"..account.name.."'. JSON (debug): " .. (enableDebug and dump(txJsonData) or "Debug disabled"))
-            moreTransactionsExist = false; break
-        end
-        
-        local numFetchedThisPage = #mercuryAPITransactions
-        totalTransactionsFetchedFromApi = totalTransactionsFetchedFromApi + numFetchedThisPage
-        debugLog("RefreshAccount: API Transactions on page " .. pagesFetched .. " for '"..account.name.."': " .. numFetchedThisPage .. ". Total so far: " .. totalTransactionsFetchedFromApi)
-        if txJsonData.total then debugLog("RefreshAccount: API reports 'total' transactions for '"..account.name.."': " .. txJsonData.total) end
-
-        if numFetchedThisPage == 0 then 
-            moreTransactionsExist = false 
+    if isTreasuryAccount then
+        -- Treasury: dedicated endpoint GET /api/v1/treasury/{id}/transactions (cursor pagination, no start= filter)
+        local transactionsApiUrlBase = "https://api.mercury.com/api/v1/treasury/" .. mercuryAccountUUID .. "/transactions"
+        local treasuryTxLimit = 1000
+        local cursor = nil -- API returns next cursor in response; omit on first request
+        local moreTreasuryPages = true
+        local treasuryPagesFetched = 0
+        local treasuryMaxPages = 500 -- safety cap (~500k rows); raise if needed
+        local unixEpochStartApprox = 0
+        local sinceDateStr = nil
+        if since and since > unixEpochStartApprox then
+            local dateSinceTable = os.date("!*t", since)
+            sinceDateStr = string.format("%04d-%02d-%02d", dateSinceTable.year, dateSinceTable.month, dateSinceTable.day)
+            debugLog("RefreshAccount: Treasury incremental fetch for '"..account.name.."', include rows on/after canonicalDay " .. sinceDateStr)
         else
-            for _, tx in ipairs(mercuryAPITransactions) do
-                local isBooked = tx.postedAt ~= nil
-                local isValidStatus = tx.status == "sent" or tx.status == "completed" or (not tx.status and tx.postedAt) 
-                if isBooked and isValidStatus then
-                    local bDate = tx.createdAt
-                    local vDate = tx.postedAt or tx.createdAt
-                    local mAmount = tx.amount
-                    local mPurpose = tx.note or tx.externalMemo or tx.bankDescription or ""
-                    local mCounterparty = tx.counterpartyName or tx.counterpartyNickname or ""
-                    local bText = tx.kind or ""
-                    local accNum = nil
-                    local routeNum = nil
+            debugLog("RefreshAccount: Treasury full history fetch for '"..account.name.."'")
+        end
 
-                    if tx.details then
-                        local rInfo = tx.details.electronicRoutingInfo or tx.details.domesticWireRoutingInfo or tx.details.internationalWireRoutingInfo
-                        if rInfo then
-                            accNum = rInfo.accountNumber
-                            routeNum = rInfo.routingNumber
-                        end
-                    end
-                    
-                    if bDate and mAmount then
-                        local bTimestamp = parseDate(bDate)
-                        local vTimestamp = parseDate(vDate)
-                        if bTimestamp then
-                            table.insert(allTransactionsForMoneyMoney, {
-                                bookingDate=bTimestamp, valueDate=vTimestamp, amount=tonumber(mAmount), purpose=mPurpose,
-                                name=mCounterparty, accountNumber=accNum, bankCode=routeNum, transactionCode=nil, bookingText=bText
-                            })
+        while moreTreasuryPages and treasuryPagesFetched < treasuryMaxPages do
+            treasuryPagesFetched = treasuryPagesFetched + 1
+            local q = "?limit=" .. treasuryTxLimit .. "&order=desc"
+            if cursor ~= nil then q = q .. "&cursor=" .. urlEncode(tostring(cursor)) end
+            local fullApiUrl = transactionsApiUrlBase .. q
+            debugLog("RefreshAccount: Treasury transactions URL (page " .. treasuryPagesFetched .. "): " .. fullApiUrl)
+
+            local txContent = connection:request("GET", fullApiUrl, "", "", headers)
+            if not txContent or txContent == "" then
+                criticalLog("RefreshAccount: ERROR - No response from Treasury transactions API (page " .. treasuryPagesFetched .. ") for '" .. account.name .. "'")
+                break
+            end
+
+            local txJsonData, txParseErr = safeParseJSON(txContent)
+            if not txJsonData or txParseErr then
+                criticalLog("RefreshAccount: ERROR parsing Treasury transactions JSON (page " .. treasuryPagesFetched .. "): " .. tostring(txParseErr))
+                break
+            end
+            if txJsonData.errors then
+                criticalLog("RefreshAccount: Treasury transactions API errors (page " .. treasuryPagesFetched .. "): " .. (enableDebug and dump(txJsonData.errors) or "Debug disabled"))
+                break
+            end
+
+            local mercuryAPITransactions = txJsonData.transactions
+            if type(mercuryAPITransactions) ~= "table" then
+                criticalLog("RefreshAccount: Treasury response missing 'transactions' array (page " .. treasuryPagesFetched .. ")")
+                break
+            end
+
+            local numFetchedThisPage = #mercuryAPITransactions
+            totalTransactionsFetchedFromApi = totalTransactionsFetchedFromApi + numFetchedThisPage
+            debugLog("RefreshAccount: Treasury page " .. treasuryPagesFetched .. ": " .. numFetchedThisPage .. " rows, total " .. totalTransactionsFetchedFromApi)
+
+            local stopDueToSince = false
+            if numFetchedThisPage == 0 then
+                moreTreasuryPages = false
+            else
+                for _, tx in ipairs(mercuryAPITransactions) do
+                    local txType = tx.type or ""
+                    if string.match(txType, "Canceled$") or string.match(txType, "Failed$") then
+                        -- Skip failed/canceled Treasury rows
+                    else
+                        local canon = tx.canonicalDay
+                        if sinceDateStr and canon and type(canon) == "string" and canon < sinceDateStr then
+                            stopDueToSince = true
+                            break
+                        else
+                            local mAmount = tx.amount
+                            if mAmount ~= nil then
+                                local bTimestamp = parseDate(canon)
+                                if bTimestamp then
+                                    local purpose = tx.description or ""
+                                    if tx.additionalDetails and tx.additionalDetails ~= "" then
+                                        purpose = (purpose ~= "" and (purpose .. " — ") or "") .. tx.additionalDetails
+                                    end
+                                    local bText = txType
+                                    table.insert(allTransactionsForMoneyMoney, {
+                                        bookingDate = bTimestamp,
+                                        valueDate = bTimestamp,
+                                        amount = tonumber(mAmount),
+                                        purpose = purpose,
+                                        name = "",
+                                        accountNumber = nil,
+                                        bankCode = nil,
+                                        transactionCode = tx.id,
+                                        bookingText = bText
+                                    })
+                                end
+                            end
                         end
                     end
                 end
+                local nextCursor = txJsonData.cursor
+                if nextCursor == nil then
+                    moreTreasuryPages = false
+                else
+                    cursor = nextCursor
+                end
+                if stopDueToSince then
+                    moreTreasuryPages = false
+                end
             end
-            currentOffset = currentOffset + numFetchedThisPage
-            if numFetchedThisPage < limit then moreTransactionsExist = false end
-            if txJsonData.total and totalTransactionsFetchedFromApi >= txJsonData.total then moreTransactionsExist = false end 
+            if moreTreasuryPages then MM.sleep(0.5) end
         end
-        if moreTransactionsExist then MM.sleep(0.5) end 
+
+        if treasuryPagesFetched >= treasuryMaxPages then
+            criticalLog("WARNING: Treasury transaction pagination hit safety cap (" .. treasuryMaxPages .. " pages) for '" .. account.name .. "'. Older rows may be missing.")
+        end
+    else
+        -- Regular + Credit: GET /api/v1/account/{id}/transactions (offset/limit, date filter)
+        local transactionsApiUrlBase = "https://api.mercury.com/api/v1/account/" .. mercuryAccountUUID .. "/transactions"
+        debugLog("RefreshAccount: Fetching transactions for '"..account.name.."' (ID: "..mercuryAccountUUID..") via /account/{id}/transactions.")
+
+        local currentOffset = 0
+        local limit = 200
+        local moreTransactionsExist = true
+        local pagesFetched = 0
+        local queryParams = {}
+        local unixEpochStartApprox = 0
+
+        if not since or since <= unixEpochStartApprox then
+            queryParams.start = "2000-01-01"
+            debugLog("RefreshAccount: 'since' ("..tostring(since)..") for '"..account.name.."' indicates initial fetch. Setting 'start' to " .. queryParams.start)
+        else
+            local dateSinceTable = os.date("!*t", since)
+            queryParams.start = string.format("%04d-%02d-%02d", dateSinceTable.year, dateSinceTable.month, dateSinceTable.day)
+            debugLog("RefreshAccount: Normal fetch for '"..account.name.."'. Filtering transactions with 'start': " .. queryParams.start)
+        end
+
+        while moreTransactionsExist and pagesFetched < 25 do
+            pagesFetched = pagesFetched + 1
+            queryParams.limit = limit
+            queryParams.offset = currentOffset
+
+            local queryParamsString = ""
+            local firstParam = true
+            for key, value in pairs(queryParams) do
+                queryParamsString = queryParamsString .. (firstParam and "?" or "&") .. urlEncode(key) .. "=" .. urlEncode(value)
+                firstParam = false
+            end
+
+            local fullApiUrl = transactionsApiUrlBase .. queryParamsString
+            debugLog("RefreshAccount: API URL for '"..account.name.."' (Page " .. pagesFetched .. ", Offset " .. currentOffset .. "): " .. fullApiUrl)
+
+            local txContent = connection:request( "GET", fullApiUrl, "", "", headers )
+            if not txContent or txContent == "" then
+                criticalLog("RefreshAccount: ERROR - No response from API (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."', URL: " .. fullApiUrl)
+                moreTransactionsExist = false; break
+            end
+
+            if enableDebug and #txContent < 2000 then debugLog("RefreshAccount: Response Body (Page " .. pagesFetched .. "): " .. txContent)
+            elseif enableDebug then debugLog("RefreshAccount: Response Body (Page " .. pagesFetched .. ", truncated): " .. string.sub(txContent, 1, 1500)) end
+
+            local txJsonData, tx_ParseError = safeParseJSON(txContent)
+            if not txJsonData or tx_ParseError then
+                criticalLog("RefreshAccount: ERROR parsing JSON (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."': " .. tostring(tx_ParseError))
+                moreTransactionsExist = false; break
+            end
+
+            if txJsonData.errors then
+                criticalLog("RefreshAccount: API reports errors (Transactions, Page " .. pagesFetched .. ") for '"..account.name.."': " .. (enableDebug and dump(txJsonData.errors) or "Debug disabled"))
+                moreTransactionsExist = false; break
+            end
+
+            local mercuryAPITransactions = txJsonData.transactions
+            if type(mercuryAPITransactions) ~= "table" then
+                criticalLog("RefreshAccount: 'transactions' array not found in JSON (Page " .. pagesFetched .. ") for '"..account.name.."'. JSON (debug): " .. (enableDebug and dump(txJsonData) or "Debug disabled"))
+                moreTransactionsExist = false; break
+            end
+
+            local numFetchedThisPage = #mercuryAPITransactions
+            totalTransactionsFetchedFromApi = totalTransactionsFetchedFromApi + numFetchedThisPage
+            debugLog("RefreshAccount: API Transactions on page " .. pagesFetched .. " for '"..account.name.."': " .. numFetchedThisPage .. ". Total so far: " .. totalTransactionsFetchedFromApi)
+            if txJsonData.total then debugLog("RefreshAccount: API reports 'total' transactions for '"..account.name.."': " .. txJsonData.total) end
+
+            if numFetchedThisPage == 0 then
+                moreTransactionsExist = false
+            else
+                for _, tx in ipairs(mercuryAPITransactions) do
+                    local isBooked = tx.postedAt ~= nil
+                    local isValidStatus = tx.status == "sent" or tx.status == "completed" or (not tx.status and tx.postedAt)
+                    if isBooked and isValidStatus then
+                        local bDate = tx.createdAt
+                        local vDate = tx.postedAt or tx.createdAt
+                        local mAmount = tx.amount
+                        local mPurpose = tx.note or tx.externalMemo or tx.bankDescription or ""
+                        local mCounterparty = tx.counterpartyName or tx.counterpartyNickname or ""
+                        local bText = tx.kind or ""
+                        local accNum = nil
+                        local routeNum = nil
+
+                        if tx.details then
+                            local rInfo = tx.details.electronicRoutingInfo or tx.details.domesticWireRoutingInfo or tx.details.internationalWireRoutingInfo
+                            if rInfo then
+                                accNum = rInfo.accountNumber
+                                routeNum = rInfo.routingNumber
+                            end
+                        end
+
+                        if bDate and mAmount then
+                            local bTimestamp = parseDate(bDate)
+                            local vTimestamp = parseDate(vDate)
+                            if bTimestamp then
+                                table.insert(allTransactionsForMoneyMoney, {
+                                    bookingDate=bTimestamp, valueDate=vTimestamp, amount=tonumber(mAmount), purpose=mPurpose,
+                                    name=mCounterparty, accountNumber=accNum, bankCode=routeNum, transactionCode=nil, bookingText=bText
+                                })
+                            end
+                        end
+                    end
+                end
+                currentOffset = currentOffset + numFetchedThisPage
+                if numFetchedThisPage < limit then moreTransactionsExist = false end
+                if txJsonData.total and totalTransactionsFetchedFromApi >= txJsonData.total then moreTransactionsExist = false end
+            end
+            if moreTransactionsExist then MM.sleep(0.5) end
+        end
+
+        if pagesFetched >= 25 then
+            criticalLog("WARNING: Hit pagination limit of 5000 transactions for '"..account.name.."'. Some older transactions may be missing.")
+        end
     end
 
-    if pagesFetched >= 25 then
-        criticalLog("WARNING: Hit pagination limit of 5000 transactions for '"..account.name.."'. Some older transactions may be missing.")
-    end
-    
     debugLog("RefreshAccount: Pagination for '"..account.name.."' finished. Total API transactions processed: " .. totalTransactionsFetchedFromApi .. ". Formatted for MoneyMoney: " .. #allTransactionsForMoneyMoney)
     
     return {
